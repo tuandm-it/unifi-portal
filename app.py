@@ -9,12 +9,13 @@ import os
 import re
 import time
 from collections import defaultdict, deque
+from urllib.parse import urlencode, urlparse
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 
@@ -40,6 +41,10 @@ BRAND_TITLE = os.getenv("BRAND_TITLE", "Xin chào")
 BRAND_SUBTITLE = os.getenv("BRAND_SUBTITLE", "Chào mừng bạn đến với WiFi miễn phí")
 FOOTER_TEXT = os.getenv("FOOTER_TEXT", "Free WiFi")
 BRAND_COLOR = os.getenv("BRAND_COLOR", "#e02020")
+# --- Grandstream (GWN): portal chuyển khách về AP kèm username/password để AP hỏi RADIUS ---
+GWN_SHARED_PASSWORD = os.getenv("GWN_SHARED_PASSWORD", "")  # phải trùng mật khẩu RADIUS chấp nhận
+GWN_USER_SUFFIX = os.getenv("GWN_USER_SUFFIX", "")  # vd "@gwn" nếu RADIUS yêu cầu
+GWN_LOGIN_HOSTS = [h.strip().lower() for h in os.getenv("GWN_LOGIN_HOSTS", "cwp.gwnportal.cloud").split(",") if h.strip()]
 if not re.fullmatch(r"#[0-9a-fA-F]{3,8}", BRAND_COLOR):
     BRAND_COLOR = "#e02020"
 SESSION_MINUTES = int(os.getenv("SESSION_MINUTES", "480"))
@@ -168,67 +173,113 @@ def page(body):
     return HTMLResponse(out)
 
 
-def form_page(site, mac, ap, ssid, url, error=""):
+def form_page(site, mac, ap, ssid, url, error="", login_url=""):
     h = lambda v: html.escape(v or "", quote=True)
     err = f'<div class="e">{h(error)}</div>' if error else ""
     return page(f"""{err}
 <form method="post" action="/login">
 <input type="hidden" name="site" value="{h(site)}"><input type="hidden" name="id" value="{h(mac)}">
 <input type="hidden" name="ap" value="{h(ap)}"><input type="hidden" name="ssid" value="{h(ssid)}">
-<input type="hidden" name="url" value="{h(url)}">
+<input type="hidden" name="url" value="{h(url)}"><input type="hidden" name="login_url" value="{h(login_url)}">
 <input type="tel" name="phone" placeholder="Nhập số điện thoại (09xx xxx xxx)" autocomplete="tel" required>
 <button type="submit">Kết nối</button></form>""")
 
 
 # ---------- Route ----------
+MAC_KEYS = ("id", "mac", "clientMac", "client_mac", "usermac", "sta_mac", "clientmac")
+URL_KEYS = ("url", "orig_url")
+AP_KEYS = ("ap", "apmac", "ap_mac", "gw_id")
+
+
+def pick(q, keys):
+    for k in keys:
+        if q.get(k):
+            return q.get(k)
+    return ""
+
+
+def gwn_login_ok(u):
+    """Chỉ chấp nhận login_url trỏ về máy chủ Grandstream đã khai báo (tránh open redirect)."""
+    try:
+        x = urlparse(u)
+    except ValueError:
+        return False
+    host = (x.hostname or "").lower()
+    return x.scheme in ("http", "https") and bool(host) and (
+        host in GWN_LOGIN_HOSTS or host.endswith(".gwnportal.cloud"))
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "mock": UNIFI_MOCK}
+
+
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
+    # Luôn hiện trang portal; nhận nhiều tên tham số MAC khác nhau (UniFi, Grandstream...)
     q = request.query_params
-    if q.get("id"):  # một số phiên bản UniFi redirect thẳng về URL gốc kèm ?id=...
-        return form_page(q.get("site") or DEFAULT_SITE, q.get("id", ""),
-                         q.get("ap", ""), q.get("ssid", ""), q.get("url", ""))
-    return HTMLResponse(f"ok, mock={UNIFI_MOCK}")
+    log.info("root query: %s", dict(q))
+    return form_page(q.get("site") or DEFAULT_SITE, pick(q, MAC_KEYS), pick(q, AP_KEYS),
+                     q.get("ssid", ""), pick(q, URL_KEYS), login_url=q.get("login_url", ""))
 
 
 @app.get("/guest/s/{site}/", response_class=HTMLResponse)
 @app.get("/guest/s/{site}", response_class=HTMLResponse)
 def guest(site: str, request: Request):
     q = request.query_params
-    return form_page(site, q.get("id", ""), q.get("ap", ""), q.get("ssid", ""), q.get("url", ""))
+    return form_page(site, pick(q, MAC_KEYS), pick(q, AP_KEYS), q.get("ssid", ""),
+                     pick(q, URL_KEYS), login_url=q.get("login_url", ""))
 
 
 @app.post("/login", response_class=HTMLResponse)
 def login(request: Request, phone: str = Form(""), site: str = Form("default"),
           mac: str = Form("", alias="id"), ap: str = Form(""),
-          ssid: str = Form(""), url: str = Form("")):
-    mac = mac.lower().strip()
+          ssid: str = Form(""), url: str = Form(""), login_url: str = Form("")):
+    mac = mac.lower().strip().replace("-", ":")
     if not SITE_RE.match(site) or not MAC_RE.match(mac):
-        return form_page(site, mac, ap, ssid, url, "Thiếu thông tin thiết bị, hãy kết nối lại WiFi.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Thiếu thông tin thiết bị, hãy kết nối lại WiFi.")
 
     key = f"{request.client.host}|{mac}"
     if too_many(key):
         write_log(phone, mac, ap, ssid, "rate_limited")
-        return form_page(site, mac, ap, ssid, url, "Thử quá nhiều lần, vui lòng đợi ít phút.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Thử quá nhiều lần, vui lòng đợi ít phút.")
 
     p = normalize_phone(phone)
     if not p:
         add_fail(key)
         write_log(phone, mac, ap, ssid, "bad_format")
-        return form_page(site, mac, ap, ssid, url, "Số điện thoại không hợp lệ.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Số điện thoại không hợp lệ.")
 
     with engine.connect() as c:
         row = c.execute(text("SELECT active FROM customers WHERE phone=:p"), {"p": p}).fetchone()
     if not row or not row[0]:
         add_fail(key)
         write_log(p, mac, ap, ssid, "denied")
-        return form_page(site, mac, ap, ssid, url, "Số điện thoại chưa được đăng ký.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Số điện thoại chưa được đăng ký.")
+
+    if login_url and gwn_login_ok(login_url):  # luồng Grandstream: chuyển về AP để AP hỏi RADIUS
+        if not GWN_SHARED_PASSWORD:
+            log.error("Thiếu GWN_SHARED_PASSWORD")
+            write_log(p, mac, ap, ssid, "gwn_not_configured")
+            return form_page(site, mac, ap, ssid, url, login_url=login_url,
+                             error="Hệ thống chưa cấu hình xong.")
+        back = url if url.startswith(("http://", "https://")) else "http://connectivitycheck.gstatic.com/generate_204"
+        qs = urlencode({"username": p + GWN_USER_SUFFIX, "password": GWN_SHARED_PASSWORD, "redirect": back})
+        target = login_url + ("&" if "?" in login_url else "?") + qs
+        write_log(p, mac, ap, ssid, "ok_gwn_handoff")
+        return RedirectResponse(target, status_code=303)
 
     try:
         unifi_authorize(site, mac, SESSION_MINUTES)
     except Exception:
         log.exception("authorize lỗi")
         write_log(p, mac, ap, ssid, "controller_error")
-        return form_page(site, mac, ap, ssid, url, "Hệ thống đang bận, vui lòng thử lại.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Hệ thống đang bận, vui lòng thử lại.")
 
     write_log(p, mac, ap, ssid, "ok")
     safe = url if url.startswith(("http://", "https://")) else ""
