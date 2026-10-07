@@ -1,0 +1,33 @@
+# Tùy chọn: dùng khi deploy bằng Render Blueprint. Có thể bỏ qua nếu tạo Web Service thủ công.
+services:
+  - type: web
+    name: unifi-portal
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: UNIFI_MOCK
+        value: "1"
+      - key: UNIFI_BASE
+        sync: false
+      - key: UNIFI_USER
+        sync: false
+      - key: UNIFI_PASS
+        sync: false
+      - key: UNIFI_OS
+        value: "0"
+      - key: UNIFI_VERIFY_TLS
+        value: "1"
+      - key: UNIFI_SITE
+        value: default
+      - key: BRAND_TITLE
+        value: Xin chào
+      - key: BRAND_SUBTITLE
+        value: Chào mừng bạn đến với WiFi miễn phí
+      - key: FOOTER_TEXT
+        value: Free WiFi
+      - key: BRAND_COLOR
+        value: "#e02020"
