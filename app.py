@@ -215,6 +215,29 @@ def gwn_login_ok(u):
         host in GWN_LOGIN_HOSTS or host.endswith(".gwnportal.cloud"))
 
 
+def radius_success(mac):
+    """RADIUS (FreeRADIUS) ghi result='SUCCESS' vào login_log khi chấp nhận; kiểm tra trong 2 phút gần nhất."""
+    m = (mac or "").lower().replace("-", ":")
+    try:
+        with engine.connect() as c:
+            row = c.execute(text(
+                "SELECT 1 FROM login_log WHERE result = 'SUCCESS' "
+                "AND lower(replace(mac, '-', ':')) = :m "
+                "AND ts >= to_char(NOW() - interval '2 minutes', 'YYYY-MM-DD HH24:MI:SS') LIMIT 1"),
+                {"m": m}).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def returned_state(mac):
+    """'' = khách mới; 'ok' = vừa chuyển về AP và RADIUS đã chấp nhận; 'fail' = vừa chuyển về AP mà chưa thấy chấp nhận."""
+    t = handoff.pop((mac or "").lower().replace("-", ":"), None)
+    if t and time.time() - t < HANDOFF_SEC:
+        return "ok" if radius_success(mac) else "fail"
+    return ""
+
+
 def returned_error(mac):
     """Nếu khách vừa được chuyển về AP rồi bị AP trả lại trang này thì báo chưa xác thực được."""
     t = handoff.pop((mac or "").lower().replace("-", ":"), None)
@@ -248,8 +271,13 @@ def root(request: Request):
     q = request.query_params
     log.info("root query: %s", dict(q))
     mac = pick(q, MAC_KEYS)
+    st = returned_state(mac)
+    if st == "ok":
+        return page("<p class='sub'><b>Đăng nhập thành công.</b> Bạn đã có thể sử dụng WiFi.</p>")
+    err = ("Chưa xác thực được với hệ thống WiFi. Vui lòng thử lại hoặc liên hệ nhân viên."
+           if st == "fail" else "")
     return form_page(q.get("site") or DEFAULT_SITE, mac, pick(q, AP_KEYS),
-                     q.get("ssid", ""), pick(q, URL_KEYS), error=returned_error(mac),
+                     q.get("ssid", ""), pick(q, URL_KEYS), error=err,
                      login_url=q.get("login_url", ""))
 
 
@@ -258,9 +286,13 @@ def root(request: Request):
 def guest(site: str, request: Request):
     q = request.query_params
     mac = pick(q, MAC_KEYS)
+    st = returned_state(mac)
+    if st == "ok":
+        return page("<p class='sub'><b>Đăng nhập thành công.</b> Bạn đã có thể sử dụng WiFi.</p>")
+    err = ("Chưa xác thực được với hệ thống WiFi. Vui lòng thử lại hoặc liên hệ nhân viên."
+           if st == "fail" else "")
     return form_page(site, mac, pick(q, AP_KEYS), q.get("ssid", ""),
-                     pick(q, URL_KEYS), error=returned_error(mac),
-                     login_url=q.get("login_url", ""))
+                     pick(q, URL_KEYS), error=err, login_url=q.get("login_url", ""))
 
 
 @app.post("/login", response_class=HTMLResponse)
