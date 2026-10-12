@@ -3,6 +3,7 @@
 Luồng: UniFi redirect khách -> /guest/s/<site>/?id=<MAC>&ap=..&ssid=..&url=..
        khách nhập SĐT -> tra bảng customers -> có và active thì gọi API UniFi authorize MAC.
 """
+import hashlib
 import html
 import logging
 import os
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 
@@ -43,6 +44,9 @@ FOOTER_TEXT = os.getenv("FOOTER_TEXT", "Free WiFi")
 BRAND_COLOR = os.getenv("BRAND_COLOR", "#e02020")
 # --- Grandstream (GWN): portal chuyển khách về AP kèm username/password để AP hỏi RADIUS ---
 GWN_SHARED_PASSWORD = os.getenv("GWN_SHARED_PASSWORD", "")  # phải trùng mật khẩu RADIUS chấp nhận
+# Cách tạo mật khẩu gửi cho AP: shared = dùng GWN_SHARED_PASSWORD; phone = mật khẩu chính là số điện thoại;
+# derived = md5(số điện thoại + GWN_SHARED_PASSWORD) (khớp view radcheck dùng md5(phone || bí mật))
+GWN_PASSWORD_MODE = os.getenv("GWN_PASSWORD_MODE", "shared").lower()
 GWN_USER_SUFFIX = os.getenv("GWN_USER_SUFFIX", "")  # vd "@gwn" nếu RADIUS yêu cầu
 GWN_LOGIN_HOSTS = [h.strip().lower() for h in os.getenv("GWN_LOGIN_HOSTS", "cwp.gwnportal.cloud").split(",") if h.strip()]
 if not re.fullmatch(r"#[0-9a-fA-F]{3,8}", BRAND_COLOR):
@@ -70,6 +74,8 @@ app = FastAPI()
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 fails = defaultdict(deque)
+handoff = {}  # MAC -> thời điểm vừa chuyển khách về AP (để biết khi AP trả khách về = xác thực thất bại)
+HANDOFF_SEC = 90
 
 MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 SITE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -209,6 +215,23 @@ def gwn_login_ok(u):
         host in GWN_LOGIN_HOSTS or host.endswith(".gwnportal.cloud"))
 
 
+def returned_error(mac):
+    """Nếu khách vừa được chuyển về AP rồi bị AP trả lại trang này thì báo chưa xác thực được."""
+    t = handoff.pop((mac or "").lower().replace("-", ":"), None)
+    if t and time.time() - t < HANDOFF_SEC:
+        return "Chưa xác thực được với hệ thống WiFi. Vui lòng thử lại hoặc liên hệ nhân viên."
+    return ""
+
+
+@app.get("/ok", response_class=HTMLResponse)
+def ok_page(mac: str = "", u: str = ""):
+    """AP chuyển khách về đây sau khi RADIUS chấp nhận."""
+    handoff.pop(mac.lower().replace("-", ":"), None)
+    safe = u if u.startswith(("http://", "https://")) else ""
+    refresh = f'<meta http-equiv="refresh" content="4;url={html.escape(safe, quote=True)}">' if safe else ""
+    return page(f"{refresh}<p class='sub'><b>Đăng nhập thành công.</b> Bạn đã có thể sử dụng WiFi.</p>")
+
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status_code=204)
@@ -224,16 +247,20 @@ def root(request: Request):
     # Luôn hiện trang portal; nhận nhiều tên tham số MAC khác nhau (UniFi, Grandstream...)
     q = request.query_params
     log.info("root query: %s", dict(q))
-    return form_page(q.get("site") or DEFAULT_SITE, pick(q, MAC_KEYS), pick(q, AP_KEYS),
-                     q.get("ssid", ""), pick(q, URL_KEYS), login_url=q.get("login_url", ""))
+    mac = pick(q, MAC_KEYS)
+    return form_page(q.get("site") or DEFAULT_SITE, mac, pick(q, AP_KEYS),
+                     q.get("ssid", ""), pick(q, URL_KEYS), error=returned_error(mac),
+                     login_url=q.get("login_url", ""))
 
 
 @app.get("/guest/s/{site}/", response_class=HTMLResponse)
 @app.get("/guest/s/{site}", response_class=HTMLResponse)
 def guest(site: str, request: Request):
     q = request.query_params
-    return form_page(site, pick(q, MAC_KEYS), pick(q, AP_KEYS), q.get("ssid", ""),
-                     pick(q, URL_KEYS), login_url=q.get("login_url", ""))
+    mac = pick(q, MAC_KEYS)
+    return form_page(site, mac, pick(q, AP_KEYS), q.get("ssid", ""),
+                     pick(q, URL_KEYS), error=returned_error(mac),
+                     login_url=q.get("login_url", ""))
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -263,16 +290,27 @@ def login(request: Request, phone: str = Form(""), site: str = Form("default"),
         return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Số điện thoại chưa được đăng ký.")
 
     if login_url and gwn_login_ok(login_url):  # luồng Grandstream: chuyển về AP để AP hỏi RADIUS
-        if not GWN_SHARED_PASSWORD:
+        if GWN_PASSWORD_MODE == "phone":
+            gwn_pw = p
+        elif GWN_PASSWORD_MODE == "derived":
+            gwn_pw = hashlib.md5((p + GWN_SHARED_PASSWORD).encode()).hexdigest() if GWN_SHARED_PASSWORD else ""
+        else:
+            gwn_pw = GWN_SHARED_PASSWORD
+        if not gwn_pw:
             log.error("Thiếu GWN_SHARED_PASSWORD")
             write_log(p, mac, ap, ssid, "gwn_not_configured")
             return form_page(site, mac, ap, ssid, url, login_url=login_url,
                              error="Hệ thống chưa cấu hình xong.")
         back = url if url.startswith(("http://", "https://")) else "http://connectivitycheck.gstatic.com/generate_204"
-        qs = urlencode({"username": p + GWN_USER_SUFFIX, "password": GWN_SHARED_PASSWORD, "redirect": back})
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        proto = request.headers.get("x-forwarded-proto", "https")
+        done = f"{proto}://{host}/ok?" + urlencode({"mac": mac, "u": back})  # AP chuyển về đây khi thành công
+        qs = urlencode({"username": p + GWN_USER_SUFFIX, "password": gwn_pw, "redirect": done})
         target = login_url + ("&" if "?" in login_url else "?") + qs
+        handoff[mac] = time.time()
         write_log(p, mac, ap, ssid, "ok_gwn_handoff")
-        return RedirectResponse(target, status_code=303)
+        return page(f"<meta http-equiv=\"refresh\" content=\"2;url={html.escape(target, quote=True)}\">"
+                    "<p class='sub'><b>Số điện thoại hợp lệ.</b> Đang kết nối WiFi, vui lòng chờ...</p>")
 
     try:
         unifi_authorize(site, mac, SESSION_MINUTES)
