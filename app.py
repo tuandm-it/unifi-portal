@@ -5,6 +5,7 @@ Luồng: UniFi redirect khách -> /guest/s/<site>/?id=<MAC>&ap=..&ssid=..&url=..
 """
 import hashlib
 import html
+import ipaddress
 import logging
 import os
 import re
@@ -49,6 +50,11 @@ GWN_SHARED_PASSWORD = os.getenv("GWN_SHARED_PASSWORD", "")  # phải trùng mậ
 GWN_PASSWORD_MODE = os.getenv("GWN_PASSWORD_MODE", "shared").lower()
 GWN_USER_SUFFIX = os.getenv("GWN_USER_SUFFIX", "")  # vd "@gwn" nếu RADIUS yêu cầu
 GWN_LOGIN_HOSTS = [h.strip().lower() for h in os.getenv("GWN_LOGIN_HOSTS", "cwp.gwnportal.cloud").split(",") if h.strip()]
+# --- Extreme WiNG: portal gửi form (f_user, f_pass, f_hs_server, f_Qv) về controller bằng trình duyệt của khách ---
+WING_LOGIN_SCHEME = os.getenv("WING_LOGIN_SCHEME", "http").lower()          # http (cổng 880) hoặc https (cổng 444)
+WING_LOGIN_PORT = os.getenv("WING_LOGIN_PORT", "444" if WING_LOGIN_SCHEME == "https" else "880")
+WING_LOGIN_PATH = os.getenv("WING_LOGIN_PATH", "/cgi-bin/hslogin.cgi")
+WING_HS_HOSTS = [h.strip().lower() for h in os.getenv("WING_HS_HOSTS", "").split(",") if h.strip()]
 if not re.fullmatch(r"#[0-9a-fA-F]{3,8}", BRAND_COLOR):
     BRAND_COLOR = "#e02020"
 SESSION_MINUTES = int(os.getenv("SESSION_MINUTES", "480"))
@@ -179,7 +185,7 @@ def page(body):
     return HTMLResponse(out)
 
 
-def form_page(site, mac, ap, ssid, url, error="", login_url=""):
+def form_page(site, mac, ap, ssid, url, error="", login_url="", hs_server="", qv=""):
     h = lambda v: html.escape(v or "", quote=True)
     err = f'<div class="e">{h(error)}</div>' if error else ""
     return page(f"""{err}
@@ -187,6 +193,7 @@ def form_page(site, mac, ap, ssid, url, error="", login_url=""):
 <input type="hidden" name="site" value="{h(site)}"><input type="hidden" name="id" value="{h(mac)}">
 <input type="hidden" name="ap" value="{h(ap)}"><input type="hidden" name="ssid" value="{h(ssid)}">
 <input type="hidden" name="url" value="{h(url)}"><input type="hidden" name="login_url" value="{h(login_url)}">
+<input type="hidden" name="hs_server" value="{h(hs_server)}"><input type="hidden" name="Qv" value="{h(qv)}">
 <input type="tel" name="phone" placeholder="Nhập số điện thoại (09xx xxx xxx)" autocomplete="tel" required>
 <button type="submit">Kết nối</button></form>""")
 
@@ -213,6 +220,42 @@ def gwn_login_ok(u):
     host = (x.hostname or "").lower()
     return x.scheme in ("http", "https") and bool(host) and (
         host in GWN_LOGIN_HOSTS or host.endswith(".gwnportal.cloud"))
+
+
+def wing_host_ok(hs):
+    """hs_server của WiNG: chỉ nhận IP nội bộ (private) hoặc tên máy trong WING_HS_HOSTS (tránh bị lợi dụng chuyển hướng)."""
+    hs = (hs or "").strip().lower()
+    if not hs:
+        return False
+    if hs in WING_HS_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(hs).is_private
+    except ValueError:
+        return False
+
+
+def wing_decode(qv):
+    """Qv của WiNG là chuỗi 'k=v@k=v' với mỗi ký tự bị dịch +1 (trừ '_', '=', '@'). Giải mã để lấy client_mac, ap_mac, ssid."""
+    out = {}
+    try:
+        dec = "".join(c if c in "_=@" else chr(ord(c) - 1) for c in (qv or ""))
+        for part in dec.split("@"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+
+def radius_password(p):
+    """Mật khẩu gửi cho controller (AP/WiNG) để nó hỏi RADIUS; phải khớp radcheck theo GWN_PASSWORD_MODE."""
+    if GWN_PASSWORD_MODE == "phone":
+        return p
+    if GWN_PASSWORD_MODE == "derived":
+        return hashlib.md5((p + GWN_SHARED_PASSWORD).encode()).hexdigest() if GWN_SHARED_PASSWORD else ""
+    return GWN_SHARED_PASSWORD
 
 
 def radius_success(mac):
@@ -287,6 +330,13 @@ async def root_post(request: Request):
 
 
 def root_view(q):
+    q = dict(q)
+    wq = wing_decode(q.get("Qv") or q.get("qv") or "")
+    if wq:
+        log.info("Qv decoded: %s", wq)
+        q.setdefault("client_mac", wq.get("client_mac", ""))
+        q.setdefault("ap_mac", wq.get("ap_mac", ""))
+        q.setdefault("ssid", wq.get("ssid", ""))
     mac = pick(q, MAC_KEYS)
     st = returned_state(mac)
     if st == "ok":
@@ -295,7 +345,8 @@ def root_view(q):
            if st == "fail" else "")
     return form_page(q.get("site") or DEFAULT_SITE, mac, pick(q, AP_KEYS),
                      q.get("ssid", ""), pick(q, URL_KEYS), error=err,
-                     login_url=q.get("login_url", ""))
+                     login_url=q.get("login_url", ""),
+                     hs_server=q.get("hs_server", ""), qv=q.get("Qv") or q.get("qv") or "")
 
 
 @app.post("/guest/s/{site}/", response_class=HTMLResponse)
@@ -318,6 +369,12 @@ def guest(site: str, request: Request):
 
 
 def guest_view(site, q):
+    q = dict(q)
+    wq = wing_decode(q.get("Qv") or q.get("qv") or "")
+    if wq:
+        q.setdefault("client_mac", wq.get("client_mac", ""))
+        q.setdefault("ap_mac", wq.get("ap_mac", ""))
+        q.setdefault("ssid", wq.get("ssid", ""))
     mac = pick(q, MAC_KEYS)
     st = returned_state(mac)
     if st == "ok":
@@ -325,46 +382,75 @@ def guest_view(site, q):
     err = ("Chưa xác thực được với hệ thống WiFi. Vui lòng thử lại hoặc liên hệ nhân viên."
            if st == "fail" else "")
     return form_page(site, mac, pick(q, AP_KEYS), q.get("ssid", ""),
-                     pick(q, URL_KEYS), error=err, login_url=q.get("login_url", ""))
+                     pick(q, URL_KEYS), error=err, login_url=q.get("login_url", ""),
+                     hs_server=q.get("hs_server", ""), qv=q.get("Qv") or q.get("qv") or "")
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_get(request: Request):
+    # Extreme WiNG redirect khách bằng GET /login?client_mac=..&ap_mac=..&hs_server=..&Qv=..
+    q = request.query_params
+    log.info("login GET params: %s", dict(q))
+    return root_view(q)
 
 
 @app.post("/login", response_class=HTMLResponse)
 def login(request: Request, phone: str = Form(""), site: str = Form("default"),
           mac: str = Form("", alias="id"), ap: str = Form(""),
-          ssid: str = Form(""), url: str = Form(""), login_url: str = Form("")):
+          ssid: str = Form(""), url: str = Form(""), login_url: str = Form(""),
+          hs_server: str = Form(""), qv: str = Form("", alias="Qv")):
+    if not mac and qv:
+        wq = wing_decode(qv)
+        mac, ap, ssid = wq.get("client_mac", ""), ap or wq.get("ap_mac", ""), ssid or wq.get("ssid", "")
     mac = mac.lower().strip().replace("-", ":")
     if not SITE_RE.match(site) or not MAC_RE.match(mac):
-        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Thiếu thông tin thiết bị, hãy kết nối lại WiFi.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv, error="Thiếu thông tin thiết bị, hãy kết nối lại WiFi.")
 
     key = f"{request.client.host}|{mac}"
     if too_many(key):
         write_log(phone, mac, ap, ssid, "rate_limited")
-        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Thử quá nhiều lần, vui lòng đợi ít phút.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv, error="Thử quá nhiều lần, vui lòng đợi ít phút.")
 
     p = normalize_phone(phone)
     if not p:
         add_fail(key)
         write_log(phone, mac, ap, ssid, "bad_format")
-        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Số điện thoại không hợp lệ.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv, error="Số điện thoại không hợp lệ.")
 
     with engine.connect() as c:
         row = c.execute(text("SELECT active FROM customers WHERE phone=:p"), {"p": p}).fetchone()
     if not row or not row[0]:
         add_fail(key)
         write_log(p, mac, ap, ssid, "denied")
-        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Số điện thoại chưa được đăng ký.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv, error="Số điện thoại chưa được đăng ký.")
+
+    if hs_server and qv and wing_host_ok(hs_server):  # luồng Extreme WiNG: trình duyệt khách POST về controller
+        pw = radius_password(p)
+        if not pw:
+            write_log(p, mac, ap, ssid, "wing_not_configured")
+            return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv,
+                             error="Hệ thống chưa cấu hình xong.")
+        hs = hs_server.strip()
+        action = f"{WING_LOGIN_SCHEME}://{hs}:{WING_LOGIN_PORT}{WING_LOGIN_PATH}"
+        e = lambda v: html.escape(v, quote=True)
+        write_log(p, mac, ap, ssid, "ok_wing_handoff")
+        # Thứ tự trường: f_hs_server đứng trước f_Qv (theo cộng đồng Extreme)
+        return page(
+            f'<form id="wf" method="post" action="{e(action)}">'
+            f'<input type="hidden" name="f_user" value="{e(p + GWN_USER_SUFFIX)}">'
+            f'<input type="hidden" name="f_pass" value="{e(pw)}">'
+            f'<input type="hidden" name="f_hs_server" value="{e(hs)}">'
+            f'<input type="hidden" name="f_Qv" value="{e(qv)}">'
+            '<p class="sub"><b>Số điện thoại hợp lệ.</b> Đang kết nối WiFi, vui lòng chờ...</p>'
+            '<noscript><button type="submit">Tiếp tục</button></noscript></form>'
+            '<script>setTimeout(function(){document.getElementById("wf").submit()},800)</script>')
 
     if login_url and gwn_login_ok(login_url):  # luồng Grandstream: chuyển về AP để AP hỏi RADIUS
-        if GWN_PASSWORD_MODE == "phone":
-            gwn_pw = p
-        elif GWN_PASSWORD_MODE == "derived":
-            gwn_pw = hashlib.md5((p + GWN_SHARED_PASSWORD).encode()).hexdigest() if GWN_SHARED_PASSWORD else ""
-        else:
-            gwn_pw = GWN_SHARED_PASSWORD
+        gwn_pw = radius_password(p)
         if not gwn_pw:
             log.error("Thiếu GWN_SHARED_PASSWORD")
             write_log(p, mac, ap, ssid, "gwn_not_configured")
-            return form_page(site, mac, ap, ssid, url, login_url=login_url,
+            return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv,
                              error="Hệ thống chưa cấu hình xong.")
         back = url if url.startswith(("http://", "https://")) else "http://connectivitycheck.gstatic.com/generate_204"
         host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
@@ -382,7 +468,7 @@ def login(request: Request, phone: str = Form(""), site: str = Form("default"),
     except Exception:
         log.exception("authorize lỗi")
         write_log(p, mac, ap, ssid, "controller_error")
-        return form_page(site, mac, ap, ssid, url, login_url=login_url, error="Hệ thống đang bận, vui lòng thử lại.")
+        return form_page(site, mac, ap, ssid, url, login_url=login_url, hs_server=hs_server, qv=qv, error="Hệ thống đang bận, vui lòng thử lại.")
 
     write_log(p, mac, ap, ssid, "ok")
     safe = url if url.startswith(("http://", "https://")) else ""
