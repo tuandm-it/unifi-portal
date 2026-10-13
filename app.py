@@ -113,6 +113,7 @@ def add_fail(key):
 
 
 def write_log(phone, mac, ap, ssid, result):
+    log.info("login result=%s phone=%s mac=%s ap=%s ssid=%s", result, phone, mac, ap, ssid)  # hiện cả trong log Render
     with engine.begin() as c:
         c.execute(
             text("INSERT INTO login_log VALUES (:ts,:p,:m,:a,:s,:r)"),
