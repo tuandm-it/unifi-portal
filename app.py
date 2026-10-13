@@ -269,7 +269,24 @@ def health():
 def root(request: Request):
     # Luôn hiện trang portal; nhận nhiều tên tham số MAC khác nhau (UniFi, Grandstream...)
     q = request.query_params
-    log.info("root query: %s", dict(q))
+    log.info("root GET query: %s", dict(q))
+    return root_view(q)
+
+
+@app.post("/", response_class=HTMLResponse)
+async def root_post(request: Request):
+    # Một số controller (ví dụ Extreme WiNG) redirect khách bằng POST: gộp tham số query + form
+    q = dict(request.query_params)
+    try:
+        form = await request.form()
+        q.update({k: v for k, v in form.items() if isinstance(v, str)})
+    except Exception:
+        pass
+    log.info("root POST params: %s | referer=%s", q, request.headers.get("referer", ""))
+    return root_view(q)
+
+
+def root_view(q):
     mac = pick(q, MAC_KEYS)
     st = returned_state(mac)
     if st == "ok":
@@ -281,10 +298,26 @@ def root(request: Request):
                      login_url=q.get("login_url", ""))
 
 
+@app.post("/guest/s/{site}/", response_class=HTMLResponse)
+@app.post("/guest/s/{site}", response_class=HTMLResponse)
+async def guest_post(site: str, request: Request):
+    q = dict(request.query_params)
+    try:
+        form = await request.form()
+        q.update({k: v for k, v in form.items() if isinstance(v, str)})
+    except Exception:
+        pass
+    log.info("guest POST params: %s", q)
+    return guest_view(site, q)
+
+
 @app.get("/guest/s/{site}/", response_class=HTMLResponse)
 @app.get("/guest/s/{site}", response_class=HTMLResponse)
 def guest(site: str, request: Request):
-    q = request.query_params
+    return guest_view(site, request.query_params)
+
+
+def guest_view(site, q):
     mac = pick(q, MAC_KEYS)
     st = returned_state(mac)
     if st == "ok":
